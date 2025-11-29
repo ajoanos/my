@@ -249,22 +249,36 @@ function sendPhaseReminderEmail(
 $periodHistory = loadPeriodHistory($historyFile);
 $historyMessage = null;
 $historyError = null;
+$testMailMessage = null;
+$testMailError = null;
+$sendTestEmailRequested = false;
 
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['period_start'])) {
-    $newDate = trim($_POST['period_start']);
-    $dt = DateTime::createFromFormat('Y-m-d', $newDate);
+$today = new DateTime('today');
+$todayStr = $today->format('Y-m-d');
+$todayDayOfMonth = $today->format('j');
+$todayName = getPolishWeekday($today);
 
-    if ($dt && $dt->format('Y-m-d') === $newDate) {
-        if (!in_array($newDate, $periodHistory, true)) {
-            $periodHistory[] = $newDate;
-            sort($periodHistory);
-            savePeriodHistory($historyFile, $periodHistory);
-            $historyMessage = 'Dodano nowy pierwszy dzień miesiączki: ' . $newDate;
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    if (isset($_POST['period_start'])) {
+        $newDate = trim($_POST['period_start']);
+        $dt = DateTime::createFromFormat('Y-m-d', $newDate);
+
+        if ($dt && $dt->format('Y-m-d') === $newDate) {
+            if (!in_array($newDate, $periodHistory, true)) {
+                $periodHistory[] = $newDate;
+                sort($periodHistory);
+                savePeriodHistory($historyFile, $periodHistory);
+                $historyMessage = 'Dodano nowy pierwszy dzień miesiączki: ' . $newDate;
+            } else {
+                $historyMessage = 'Ta data jest już w historii: ' . $newDate;
+            }
         } else {
-            $historyMessage = 'Ta data jest już w historii: ' . $newDate;
+            $historyError = 'Podaj poprawną datę w formacie RRRR-MM-DD.';
         }
-    } else {
-        $historyError = 'Podaj poprawną datę w formacie RRRR-MM-DD.';
+    }
+
+    if (isset($_POST['send_test_email'])) {
+        $sendTestEmailRequested = true;
     }
 }
 
@@ -272,10 +286,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['period_start'])) {
 $latestPeriodStart = !empty($periodHistory) ? end($periodHistory) : $lastPeriodStart;
 $historyCycleLength = computeAverageCycleLength($periodHistory);
 $effectiveCycleLength = $historyCycleLength ?: $cycleLength;
-
-$today = new DateTime('today');
-$todayStr = $today->format('Y-m-d');
-$todayName = getPolishWeekday($today);
 
 $currentCycleStart = getCurrentCycleStart($latestPeriodStart, $effectiveCycleLength);
 $currentCycleDay   = getCycleDay($currentCycleStart);
@@ -294,6 +304,33 @@ foreach ($phases as $phase) {
         'label' => $phase['name'],
         'length' => $length,
     ];
+}
+
+if ($sendTestEmailRequested) {
+    $subject = 'Test: powiadomienia fazy cyklu';
+    $body = [
+        'To jest testowy mail z panelu faz cyklu.',
+        'Jeśli go widzisz, funkcja mail() jest skonfigurowana poprawnie.',
+        '',
+        'Aktualne ustawienia:',
+        '• Adres odbiorcy: ' . $userEmail,
+        '• Adres nadawcy: ' . $fromEmail,
+        '• Dzień cyklu: ' . $currentCycleDay,
+        '• Data dzisiaj: ' . $todayStr,
+    ];
+
+    $headers = [];
+    $headers[] = 'From: ' . $fromEmail;
+    $headers[] = 'Reply-To: ' . $fromEmail;
+    $headers[] = 'Content-Type: text/plain; charset=UTF-8';
+
+    $sent = mail($userEmail, $subject, implode("\n", $body), implode("\r\n", $headers));
+
+    if ($sent) {
+        $testMailMessage = 'Wysłano testowego maila na adres: ' . $userEmail . ' (sprawdź skrzynkę i spam).';
+    } else {
+        $testMailError = 'Nie udało się wysłać testowego maila. Sprawdź ustawienia serwera pocztowego.';
+    }
 }
 
 $todayPercent = max(0, min(100, (($currentCycleDay - 1) / $effectiveCycleLength) * 100));
@@ -373,8 +410,8 @@ for ($cycleOffset = 0; $cycleOffset <= 1; $cycleOffset++) {
         .timeline { position: relative; width: 100%; height: 42px; background:#f5f5f5; border-radius: 10px; display:flex; overflow:hidden; border:1px solid #e5e5e5; }
         .timeline-phase { display:flex; align-items:center; justify-content:center; font-size:12px; color:#333; padding:0 6px; border-right:1px solid #e5e5e5; box-sizing:border-box; }
         .timeline-phase:last-child { border-right: none; }
-        .timeline-marker { position:absolute; top:-6px; width:2px; background:#e11d48; height:54px; left:0; }
-        .timeline-marker::after { content:"Dzisiaj"; position:absolute; top:-18px; left:-22px; font-size:12px; background:#e11d48; color:#fff; padding:2px 6px; border-radius:6px; }
+        .timeline-marker { position:absolute; top:-6px; width:2px; background:#e11d48; height:54px; left:0; display:flex; justify-content:center; }
+        .timeline-marker span { position:absolute; top:-22px; left:50%; transform:translateX(-50%); font-size:12px; background:#e11d48; color:#fff; padding:2px 6px; border-radius:6px; white-space:nowrap; }
         .week-grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap:10px; }
         .week-card { border:1px solid #e5e5e5; background:#fff; border-radius:10px; padding:10px; font-size:14px; }
     </style>
@@ -414,11 +451,20 @@ for ($cycleOffset = 0; $cycleOffset <= 1; $cycleOffset++) {
             <input type="date" id="period_start" name="period_start" value="<?= htmlspecialchars($todayStr) ?>">
             <button type="submit">Zapisz do historii</button>
         </form>
+        <form method="post" style="margin-top:12px;">
+            <button type="submit" name="send_test_email" value="1">Wyślij testowego maila</button>
+        </form>
         <?php if ($historyMessage): ?>
             <div class="msg ok"><?= htmlspecialchars($historyMessage) ?></div>
         <?php endif; ?>
         <?php if ($historyError): ?>
             <div class="msg error"><?= htmlspecialchars($historyError) ?></div>
+        <?php endif; ?>
+        <?php if ($testMailMessage): ?>
+            <div class="msg ok"><?= htmlspecialchars($testMailMessage) ?></div>
+        <?php endif; ?>
+        <?php if ($testMailError): ?>
+            <div class="msg error"><?= htmlspecialchars($testMailError) ?></div>
         <?php endif; ?>
         <p><strong>Ostatni zapisany początek cyklu:</strong> <?= htmlspecialchars($latestPeriodStart) ?></p>
         <?php if ($historyCycleLength): ?>
@@ -447,9 +493,12 @@ for ($cycleOffset = 0; $cycleOffset <= 1; $cycleOffset++) {
                     <?= htmlspecialchars($phase['label']) ?>
                 </div>
             <?php endforeach; ?>
-            <div class="timeline-marker" style="left: <?= $todayPercent ?>%"></div>
+            <div class="timeline-marker" style="left: <?= $todayPercent ?>%">
+                <span>Dzisiaj • dzień cyklu: <?= $currentCycleDay ?> • dzień miesiąca: <?= $todayDayOfMonth ?></span>
+            </div>
         </div>
         <p>Aktualny dzień cyklu: <strong><?= $currentCycleDay ?></strong> (<?= htmlspecialchars($todayName) ?>)</p>
+        <p>Dzień miesiąca (numer dnia w kalendarzu): <strong><?= $todayDayOfMonth ?></strong> (<?= htmlspecialchars($todayStr) ?>)</p>
     </div>
 
     <div class="box">
