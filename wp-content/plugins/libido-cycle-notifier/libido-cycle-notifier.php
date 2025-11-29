@@ -477,6 +477,34 @@ class AC_Libido_Cycle_Notifier {
     public function shortcode_chart() {
         $options = $this->get_options();
 
+        $frontMessage = '';
+        $frontError   = '';
+
+        if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['aclibido_front_add'])) {
+            $nonceOk = isset($_POST['aclibido_front_nonce']) && wp_verify_nonce($_POST['aclibido_front_nonce'], 'aclibido_front_add');
+            if ($nonceOk) {
+                $newDate = sanitize_text_field($_POST['next_cycle_start'] ?? '');
+                $dt      = DateTime::createFromFormat('Y-m-d', $newDate);
+
+                if ($dt && $dt->format('Y-m-d') === $newDate) {
+                    $historyDates = $options['period_history'];
+                    if (!in_array($newDate, $historyDates, true)) {
+                        $historyDates[] = $newDate;
+                        sort($historyDates);
+                        $options['period_history'] = array_values(array_unique($historyDates));
+                        update_option($this->option_name, $options);
+                        $frontMessage = 'Dodano nowy pierwszy dzień miesiączki: ' . esc_html($newDate);
+                    } else {
+                        $frontMessage = 'Ta data jest już zapisana: ' . esc_html($newDate);
+                    }
+                } else {
+                    $frontError = 'Podaj poprawną datę w formacie RRRR-MM-DD.';
+                }
+            } else {
+                $frontError = 'Odśwież stronę i spróbuj ponownie (błąd walidacji).';
+            }
+        }
+
         $historyDates      = $options['period_history'];
         $latestPeriodStart = !empty($historyDates) ? end($historyDates) : $options['last_period_start'];
         $historyCycle      = $this->compute_average_cycle_length($historyDates);
@@ -491,32 +519,138 @@ class AC_Libido_Cycle_Notifier {
         $cycleStart = $this->get_current_cycle_start($latestPeriodStart, $effectiveCycle);
         $cycleDay   = $this->get_cycle_day($cycleStart, $effectiveCycle);
 
+        $phaseBands = [];
+        $phaseTooltip = [];
+
+        foreach ($this->get_phases() as $phase) {
+            $phaseBands[] = [
+                'start' => $phase['start_day'],
+                'end'   => $phase['end_day'],
+                'color' => $this->get_phase_color($phase['key']),
+                'label' => $phase['name'],
+            ];
+        }
+
         for ($d = 1; $d <= $effectiveCycle; $d++) {
             $data[] = $this->calculate_libido_score($d, $effectiveCycle);
             $labelDate    = clone $cycleStart;
             $labelDate->modify('+' . ($d - 1) . ' days');
             $labels[] = ['Dzień ' . $d, $this->get_polish_weekday($labelDate)];
+
+            $phaseForDay = $this->get_phase_for_day($this->get_phases(), $d, $effectiveCycle);
+            $phaseName   = $phaseForDay['name'] ?? '—';
+            $phaseTooltip[] = 'Dzień ' . $d . ' (' . $phaseName . '): szacowane libido ' . $this->calculate_libido_score($d, $effectiveCycle) . '/100';
+        }
+
+        $calendarDays = [];
+        $tz = wp_timezone();
+        $firstOfMonth = new DateTime('first day of this month', $tz);
+        $daysInMonth  = (int) $firstOfMonth->format('t');
+        for ($i = 0; $i < $daysInMonth; $i++) {
+            $dateObj = clone $firstOfMonth;
+            $dateObj->modify('+' . $i . ' days');
+            $cycleDayForDate = $this->get_cycle_day_for_date($cycleStart, $dateObj, $effectiveCycle);
+            $phaseForDate    = $this->get_phase_for_day($this->get_phases(), $cycleDayForDate, $effectiveCycle);
+            $calendarDays[] = [
+                'day'       => (int) $dateObj->format('j'),
+                'weekday'   => $this->get_polish_weekday($dateObj),
+                'cycle_day' => $cycleDayForDate,
+                'phase'     => $phaseForDate['key'] ?? '',
+                'color'     => $this->get_phase_color($phaseForDate['key'] ?? ''),
+                'label'     => $phaseForDate['name'] ?? 'Poza zakresem',
+                'date'      => $dateObj->format('Y-m-d'),
+            ];
         }
 
         ob_start();
         ?>
-        <div class="aclibido-chart-wrap" style="max-width:800px;margin:0 auto;">
-            <canvas id="aclibidoChartFront" height="220"></canvas>
+        <div class="aclibido-front">
+            <div class="aclibido-front__header">
+                <div>
+                    <h3 class="aclibido-front__title">Mapa libido w cyklu</h3>
+                    <p class="aclibido-front__subtitle">Kolorowe tło pokazuje fazy cyklu, a linia – szacowane libido.</p>
+                </div>
+                <form method="post" class="aclibido-front__form">
+                    <?php wp_nonce_field('aclibido_front_add', 'aclibido_front_nonce'); ?>
+                    <input type="hidden" name="aclibido_front_add" value="1" />
+                    <label for="next_cycle_start">Pierwszy dzień kolejnego cyklu</label>
+                    <input type="date" id="next_cycle_start" name="next_cycle_start" value="<?php echo esc_attr(date('Y-m-d')); ?>" required />
+                    <button class="aclibido-front__btn">Dodaj do historii</button>
+                </form>
+            </div>
+
+            <?php if (!empty($frontMessage)): ?>
+                <div class="aclibido-front__notice aclibido-front__notice--ok"><?php echo $frontMessage; ?></div>
+            <?php endif; ?>
+            <?php if (!empty($frontError)): ?>
+                <div class="aclibido-front__notice aclibido-front__notice--error"><?php echo esc_html($frontError); ?></div>
+            <?php endif; ?>
+
+            <div class="aclibido-chart-wrap">
+                <canvas id="aclibidoChartFront" height="260"></canvas>
+            </div>
+            <p class="aclibido-front__legend">
+                Kolory faz: menstruacja (czerwony), folikularna (zielony), owulacja (pomarańcz), lutealna (żółty). Nałóż kursorem, aby zobaczyć podpowiedzi.
+            </p>
+
+            <div class="aclibido-calendar">
+                <h4>Widok kalendarzowy</h4>
+                <div class="aclibido-calendar__grid">
+                    <?php foreach ($calendarDays as $day): ?>
+                        <div class="aclibido-calendar__cell" style="background: <?php echo esc_attr($day['color']); ?>22; border-color: <?php echo esc_attr($day['color']); ?>;">
+                            <div class="aclibido-calendar__date"><?php echo esc_html($day['day']); ?></div>
+                            <div class="aclibido-calendar__phase"><?php echo esc_html($day['label']); ?></div>
+                            <div class="aclibido-calendar__meta">Dzień cyklu: <?php echo esc_html($day['cycle_day']); ?></div>
+                        </div>
+                    <?php endforeach; ?>
+                </div>
+            </div>
         </div>
+        <style>
+            .aclibido-front { background:#fff; border:1px solid #e7e7e7; border-radius:16px; padding:18px; box-shadow:0 10px 30px rgba(0,0,0,0.05); font-family:'Inter', system-ui, -apple-system, sans-serif; }
+            .aclibido-front__header { display:flex; gap:18px; justify-content:space-between; align-items:flex-end; flex-wrap:wrap; }
+            .aclibido-front__title { margin:0; font-size:20px; letter-spacing:-0.01em; }
+            .aclibido-front__subtitle { margin:6px 0 0; color:#555; max-width:480px; }
+            .aclibido-front__form { display:flex; gap:10px; align-items:flex-end; flex-wrap:wrap; background:#f8fafc; padding:10px 12px; border-radius:12px; border:1px solid #e2e8f0; }
+            .aclibido-front__form label { font-weight:600; color:#111827; display:block; font-size:13px; }
+            .aclibido-front__form input[type=date] { padding:8px 10px; border:1px solid #cbd5e1; border-radius:8px; min-width:180px; font-size:14px; }
+            .aclibido-front__btn { background:linear-gradient(135deg,#ef4444,#f59e0b); border:none; color:#fff; padding:9px 14px; border-radius:10px; font-weight:700; cursor:pointer; box-shadow:0 6px 16px rgba(239,68,68,0.25); }
+            .aclibido-front__btn:hover { transform:translateY(-1px); }
+            .aclibido-front__notice { margin:12px 0; padding:10px 12px; border-radius:10px; font-weight:600; }
+            .aclibido-front__notice--ok { background:#ecfdf3; color:#166534; border:1px solid #bbf7d0; }
+            .aclibido-front__notice--error { background:#fef2f2; color:#b91c1c; border:1px solid #fecdd3; }
+            .aclibido-chart-wrap { position:relative; margin-top:12px; }
+            .aclibido-front__legend { color:#475569; font-size:13px; margin:8px 0 0; }
+            .aclibido-calendar { margin-top:18px; }
+            .aclibido-calendar h4 { margin:0 0 10px; }
+            .aclibido-calendar__grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(120px,1fr)); gap:10px; }
+            .aclibido-calendar__cell { border:1px solid #e2e8f0; border-radius:12px; padding:10px; background:#f8fafc; }
+            .aclibido-calendar__date { font-size:18px; font-weight:700; color:#0f172a; }
+            .aclibido-calendar__phase { font-size:13px; color:#334155; margin-top:2px; }
+            .aclibido-calendar__meta { font-size:12px; color:#475569; margin-top:6px; }
+        </style>
         <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
         <script>
             (function() {
-                const ctx = document.getElementById('aclibidoChartFront');
-                if (!ctx) return;
+                const canvas = document.getElementById('aclibidoChartFront');
+                if (!canvas) return;
                 const data = <?php echo wp_json_encode($data); ?>;
                 const labels = <?php echo wp_json_encode($labels); ?>;
                 const currentDay = <?php echo (int) $cycleDay; ?>;
+                const bands = <?php echo wp_json_encode($phaseBands); ?>;
+                const tooltipText = <?php echo wp_json_encode($phaseTooltip); ?>;
+                const ctx = canvas.getContext('2d');
+
+                const backgroundGradient = ctx.createLinearGradient(0, 0, 0, canvas.height);
+                backgroundGradient.addColorStop(0, 'rgba(239,68,68,0.16)');
+                backgroundGradient.addColorStop(1, 'rgba(245,158,11,0.05)');
 
                 const markerPlugin = {
                     id: 'aclibidoMarkerFront',
                     afterDraw(chart) {
                         const {ctx, chartArea, scales} = chart;
-                        if (!scales?.x || !scales?.y) return;
+                        const meta = chart.getDatasetMeta(0);
+                        if (!scales?.x || !scales?.y || !meta?.data?.length) return;
                         const xPos = scales.x.getPixelForValue(currentDay - 1);
                         ctx.save();
                         ctx.strokeStyle = '#e11d48';
@@ -525,23 +659,71 @@ class AC_Libido_Cycle_Notifier {
                         ctx.moveTo(xPos, chartArea.top);
                         ctx.lineTo(xPos, chartArea.bottom);
                         ctx.stroke();
+                        ctx.fillStyle = '#fff';
+                        ctx.strokeStyle = '#e11d48';
+                        ctx.lineWidth = 1.25;
+                        const labelY = chartArea.top + 14;
+                        const labelX = xPos - 18;
+                        const labelW = 36;
+                        const labelH = 22;
+                        ctx.fillRect(labelX, labelY - 14, labelW, labelH);
+                        ctx.strokeRect(labelX, labelY - 14, labelW, labelH);
                         ctx.fillStyle = '#e11d48';
-                        ctx.font = '12px sans-serif';
+                        ctx.font = '600 12px Inter, system-ui, sans-serif';
                         ctx.textAlign = 'center';
-                        ctx.fillText('Dziś', xPos, chartArea.top - 6);
+                        ctx.fillText('Dziś', xPos, labelY);
                         ctx.restore();
                     }
                 };
 
-                new Chart(ctx, {
+                const phaseBackgroundPlugin = {
+                    id: 'aclibidoPhaseBackground',
+                    beforeDatasetsDraw(chart) {
+                        const {ctx, chartArea} = chart;
+                        const meta = chart.getDatasetMeta(0);
+                        if (!meta?.data?.length) return;
+                        const pointGap = meta.data[1] ? meta.data[1].x - meta.data[0].x : chartArea.width / Math.max(1, meta.data.length);
+
+                        ctx.save();
+                        bands.forEach((band) => {
+                            const startIndex = Math.max(0, band.start - 1);
+                            const endIndex = Math.min(meta.data.length - 1, band.end - 1);
+                            const startX = meta.data[startIndex].x - pointGap / 2;
+                            const endX = meta.data[endIndex].x + pointGap / 2;
+                            const width = endX - startX;
+                            const grad = ctx.createLinearGradient(startX, chartArea.top, endX, chartArea.top);
+                            grad.addColorStop(0, band.color);
+                            grad.addColorStop(1, band.color);
+                            ctx.fillStyle = grad;
+                            ctx.globalAlpha = 0.14;
+                            ctx.fillRect(startX, chartArea.top, width, chartArea.bottom - chartArea.top);
+                            ctx.globalAlpha = 1;
+                            ctx.fillStyle = band.color;
+                            ctx.font = '600 11px Inter, system-ui, sans-serif';
+                            ctx.textAlign = 'center';
+                            ctx.fillText(band.label, startX + width / 2, chartArea.bottom + 16);
+                        });
+                        ctx.restore();
+                    }
+                };
+
+                new Chart(canvas, {
                     type: 'line',
                     data: {
                         labels: labels,
                         datasets: [{
                             label: 'Szacowane libido (0–100)',
                             data: data,
-                            tension: 0.35,
-                            fill: true
+                            tension: 0.4,
+                            fill: true,
+                            backgroundColor: backgroundGradient,
+                            borderColor: '#e11d48',
+                            borderWidth: 3,
+                            pointRadius: 5,
+                            pointHoverRadius: 7,
+                            pointBackgroundColor: '#fff',
+                            pointBorderColor: '#e11d48',
+                            pointBorderWidth: 2,
                         }]
                     },
                     options: {
@@ -551,21 +733,34 @@ class AC_Libido_Cycle_Notifier {
                                 ticks: {
                                     callback: function(value) {
                                         return labels[value];
-                                    }
-                                }
+                                    },
+                                    color: '#475569',
+                                    font: { size: 11 }
+                                },
+                                grid: { display: false }
                             },
                             y: {
                                 suggestedMin: 0,
-                                suggestedMax: 100
+                                suggestedMax: 100,
+                                grid: { color: 'rgba(226,232,240,0.6)' },
+                                ticks: { color: '#475569' }
                             }
                         },
                         plugins: {
-                            legend: {
-                                display: false
+                            legend: { display: false },
+                            tooltip: {
+                                backgroundColor: '#0f172a',
+                                titleColor: '#f8fafc',
+                                bodyColor: '#e2e8f0',
+                                displayColors: false,
+                                callbacks: {
+                                    title: (items) => items.length ? labels[items[0].dataIndex].join(' • ') : '',
+                                    label: (ctx) => tooltipText[ctx.dataIndex] || ''
+                                }
                             }
                         }
                     },
-                    plugins: [markerPlugin]
+                    plugins: [phaseBackgroundPlugin, markerPlugin]
                 });
             })();
         </script>
@@ -700,6 +895,28 @@ class AC_Libido_Cycle_Notifier {
             }
         }
         return null;
+    }
+
+    private function get_cycle_day_for_date(DateTime $cycleStart, DateTime $targetDate, $cycleLength) {
+        $diff  = (int) $cycleStart->diff($targetDate)->format('%r%a');
+        $day   = ($diff % $cycleLength) + 1;
+        if ($day < 1) {
+            $day += $cycleLength;
+        }
+        if ($day > $cycleLength) {
+            $day = $cycleLength;
+        }
+        return $day;
+    }
+
+    private function get_phase_color($phaseKey) {
+        $map = [
+            'menstruacja' => '#ef4444',
+            'folikularna' => '#22c55e',
+            'owulacja'    => '#f97316',
+            'lutealna'    => '#fbbf24',
+        ];
+        return $map[$phaseKey] ?? '#94a3b8';
     }
 
     private function calculate_libido_score($day, $cycleLength) {
