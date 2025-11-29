@@ -6,11 +6,14 @@ date_default_timezone_set('Europe/Warsaw');
  * KONFIGURACJA
  */
 
+// Plik z historią wszystkich pierwszych dni miesiączki (zapisywany automatycznie)
+$historyFile = __DIR__ . '/period_history.json';
+
 // Data pierwszego dnia ostatniej miesiączki (dzień 1 cyklu)
-// ZMIEŃ, gdy zacznie się nowy okres
+// Wartość początkowa – zostanie nadpisana ostatnim wpisem z historii, jeśli istnieje
 $lastPeriodStart = '2025-11-28';
 
-// Długość cyklu w dniach (dostosuj pod Wasz realny, jeśli jest inny)
+// Domyślna długość cyklu w dniach (gdy brak historii do wyliczeń)
 $cycleLength = 28;
 
 // Ile dni przed startem fazy wysłać maila
@@ -98,10 +101,81 @@ function getCurrentCycleStart(string $lastPeriodStart, int $cycleLength): DateTi
     return $cycleStart;
 }
 
+function loadPeriodHistory(string $file): array {
+    if (!file_exists($file)) {
+        return [];
+    }
+
+    $data = json_decode(file_get_contents($file), true);
+    if (!is_array($data)) {
+        return [];
+    }
+
+    $validDates = [];
+    foreach ($data as $date) {
+        $dt = DateTime::createFromFormat('Y-m-d', $date);
+        if ($dt && $dt->format('Y-m-d') === $date) {
+            $validDates[] = $date;
+        }
+    }
+
+    sort($validDates);
+    return array_values(array_unique($validDates));
+}
+
+function savePeriodHistory(string $file, array $dates): void {
+    $dir = dirname($file);
+    if (!is_dir($dir)) {
+        mkdir($dir, 0755, true);
+    }
+    file_put_contents($file, json_encode(array_values($dates), JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE));
+}
+
+function computeAverageCycleLength(array $dates): ?int {
+    if (count($dates) < 2) {
+        return null;
+    }
+
+    $lengths = [];
+    for ($i = 1; $i < count($dates); $i++) {
+        $prev = new DateTime($dates[$i - 1]);
+        $current = new DateTime($dates[$i]);
+        $diff = (int)$prev->diff($current)->format('%r%a');
+        if ($diff > 0) {
+            $lengths[] = $diff;
+        }
+    }
+
+    if (empty($lengths)) {
+        return null;
+    }
+
+    return (int)round(array_sum($lengths) / count($lengths));
+}
+
+function getPolishWeekday(DateTime $date): string {
+    $names = [
+        1 => 'Poniedziałek',
+        2 => 'Wtorek',
+        3 => 'Środa',
+        4 => 'Czwartek',
+        5 => 'Piątek',
+        6 => 'Sobota',
+        7 => 'Niedziela',
+    ];
+
+    return $names[(int)$date->format('N')] ?? '';
+}
+
 function getCycleDay(DateTime $cycleStart): int {
     $today = new DateTime('today');
     $diffDays = (int)$cycleStart->diff($today)->format('%r%a');
     return $diffDays + 1; // dzień cyklu = różnica + 1
+}
+
+function getCycleDayForDate(DateTime $cycleStart, DateTime $targetDate): int {
+    $diffDays = (int)$cycleStart->diff($targetDate)->format('%r%a');
+    return $diffDays + 1;
 }
 
 function getCurrentPhase(array $phases, int $cycleDay, int $cycleLength): ?array {
@@ -169,22 +243,78 @@ function sendPhaseReminderEmail(
 }
 
 /**
- * LOGIKA POWIADOMIEŃ
+ * LOGIKA POWIADOMIEŃ I HISTORII
  */
+
+$periodHistory = loadPeriodHistory($historyFile);
+$historyMessage = null;
+$historyError = null;
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['period_start'])) {
+    $newDate = trim($_POST['period_start']);
+    $dt = DateTime::createFromFormat('Y-m-d', $newDate);
+
+    if ($dt && $dt->format('Y-m-d') === $newDate) {
+        if (!in_array($newDate, $periodHistory, true)) {
+            $periodHistory[] = $newDate;
+            sort($periodHistory);
+            savePeriodHistory($historyFile, $periodHistory);
+            $historyMessage = 'Dodano nowy pierwszy dzień miesiączki: ' . $newDate;
+        } else {
+            $historyMessage = 'Ta data jest już w historii: ' . $newDate;
+        }
+    } else {
+        $historyError = 'Podaj poprawną datę w formacie RRRR-MM-DD.';
+    }
+}
+
+// Ustalane na podstawie historii (jeśli istnieje)
+$latestPeriodStart = !empty($periodHistory) ? end($periodHistory) : $lastPeriodStart;
+$historyCycleLength = computeAverageCycleLength($periodHistory);
+$effectiveCycleLength = $historyCycleLength ?: $cycleLength;
 
 $today = new DateTime('today');
 $todayStr = $today->format('Y-m-d');
+$todayName = getPolishWeekday($today);
 
-$currentCycleStart = getCurrentCycleStart($lastPeriodStart, $cycleLength);
+$currentCycleStart = getCurrentCycleStart($latestPeriodStart, $effectiveCycleLength);
 $currentCycleDay   = getCycleDay($currentCycleStart);
-$currentPhase      = getCurrentPhase($phases, $currentCycleDay, $cycleLength);
+$currentPhase      = getCurrentPhase($phases, $currentCycleDay, $effectiveCycleLength);
+
+$timelinePhases = [];
+foreach ($phases as $phase) {
+    $phaseStart = min($phase['start_day'], $effectiveCycleLength);
+    $phaseEnd = min($phase['end_day'], $effectiveCycleLength);
+    if ($phaseEnd < $phaseStart) {
+        continue;
+    }
+
+    $length = $phaseEnd - $phaseStart + 1;
+    $timelinePhases[] = [
+        'label' => $phase['name'],
+        'length' => $length,
+    ];
+}
+
+$todayPercent = max(0, min(100, (($currentCycleDay - 1) / $effectiveCycleLength) * 100));
+
+$upcomingWeek = [];
+for ($i = 0; $i < 7; $i++) {
+    $date = (clone $today)->modify('+' . $i . ' days');
+    $cycleDay = getCycleDayForDate($currentCycleStart, $date);
+    $upcomingWeek[] = [
+        'date' => $date->format('Y-m-d'),
+        'weekday' => getPolishWeekday($date),
+        'cycle_day' => $cycleDay,
+    ];
+}
 
 // Wysyłanie maili – sprawdzamy bieżący i następny cykl
 $log = [];
 for ($cycleOffset = 0; $cycleOffset <= 1; $cycleOffset++) {
     $cycleStart = clone $currentCycleStart;
     if ($cycleOffset > 0) {
-        $cycleStart->modify('+' . ($cycleOffset * $cycleLength) . ' days');
+        $cycleStart->modify('+' . ($cycleOffset * $effectiveCycleLength) . ' days');
     }
 
     foreach ($phases as $phase) {
@@ -234,6 +364,19 @@ for ($cycleOffset = 0; $cycleOffset <= 1; $cycleOffset++) {
         .phase h3 { margin-bottom: 4px; }
         .phase p { margin: 3px 0; font-size: 14px; }
         code { background:#eee; padding:2px 4px; border-radius:4px; }
+        form.history { display:flex; gap:12px; align-items:center; margin-bottom:12px; flex-wrap:wrap; }
+        .msg { padding:8px 12px; border-radius:8px; margin-bottom:8px; font-size:14px; }
+        .msg.ok { background:#ecfdf3; color:#166534; border:1px solid #bbf7d0; }
+        .msg.error { background:#fef2f2; color:#991b1b; border:1px solid #fecdd3; }
+        .history-list { list-style: none; padding-left: 0; margin:0; }
+        .history-list li { padding:6px 0; border-bottom:1px solid #eee; font-size:14px; }
+        .timeline { position: relative; width: 100%; height: 42px; background:#f5f5f5; border-radius: 10px; display:flex; overflow:hidden; border:1px solid #e5e5e5; }
+        .timeline-phase { display:flex; align-items:center; justify-content:center; font-size:12px; color:#333; padding:0 6px; border-right:1px solid #e5e5e5; box-sizing:border-box; }
+        .timeline-phase:last-child { border-right: none; }
+        .timeline-marker { position:absolute; top:-6px; width:2px; background:#e11d48; height:54px; left:0; }
+        .timeline-marker::after { content:"Dzisiaj"; position:absolute; top:-18px; left:-22px; font-size:12px; background:#e11d48; color:#fff; padding:2px 6px; border-radius:6px; }
+        .week-grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap:10px; }
+        .week-card { border:1px solid #e5e5e5; background:#fff; border-radius:10px; padding:10px; font-size:14px; }
     </style>
 </head>
 <body>
@@ -241,9 +384,17 @@ for ($cycleOffset = 0; $cycleOffset <= 1; $cycleOffset++) {
 
     <div class="box">
         <h2>Aktualny stan</h2>
-        <p><strong>Dzisiaj:</strong> <?= htmlspecialchars($todayStr) ?></p>
+        <p><strong>Dzisiaj:</strong> <?= htmlspecialchars($todayStr) ?> (<?= htmlspecialchars($todayName) ?>)</p>
+        <p><strong>Szacowana długość cyklu:</strong> <?= $effectiveCycleLength ?> dni
+            <?php if ($historyCycleLength): ?>
+                <span class="tag">Wyliczone ze średniej historii</span>
+            <?php else: ?>
+                <span class="tag">Domyślne ustawienie</span>
+            <?php endif; ?>
+        </p>
         <p><strong>Początek ostatniego wyliczonego cyklu (dzień 1 miesiączki):</strong>
-            <?= htmlspecialchars($currentCycleStart->format('Y-m-d')) ?></p>
+            <?= htmlspecialchars($currentCycleStart->format('Y-m-d')) ?> (<?= htmlspecialchars(getPolishWeekday($currentCycleStart)) ?>)
+        </p>
         <p><strong>Dzień cyklu:</strong> <?= $currentCycleDay ?></p>
 
         <?php if ($currentPhase): ?>
@@ -254,6 +405,64 @@ for ($cycleOffset = 0; $cycleOffset <= 1; $cycleOffset++) {
         <?php else: ?>
             <p><strong>Aktualna faza:</strong> poza zakresem (sprawdź długość cyklu / datę miesiączki).</p>
         <?php endif; ?>
+    </div>
+
+    <div class="box">
+        <h2>Historia pierwszych dni miesiączki</h2>
+        <form class="history" method="post">
+            <label for="period_start"><strong>Dodaj nowy pierwszy dzień:</strong></label>
+            <input type="date" id="period_start" name="period_start" value="<?= htmlspecialchars($todayStr) ?>">
+            <button type="submit">Zapisz do historii</button>
+        </form>
+        <?php if ($historyMessage): ?>
+            <div class="msg ok"><?= htmlspecialchars($historyMessage) ?></div>
+        <?php endif; ?>
+        <?php if ($historyError): ?>
+            <div class="msg error"><?= htmlspecialchars($historyError) ?></div>
+        <?php endif; ?>
+        <p><strong>Ostatni zapisany początek cyklu:</strong> <?= htmlspecialchars($latestPeriodStart) ?></p>
+        <?php if ($historyCycleLength): ?>
+            <p><strong>Średnia długość cyklu z historii:</strong> <?= $historyCycleLength ?> dni</p>
+        <?php endif; ?>
+        <?php if (empty($periodHistory)): ?>
+            <p>Brak zapisanych dat – dodaj pierwszy wpis, aby wyliczać średnią długość cyklu.</p>
+        <?php else: ?>
+            <ul class="history-list">
+                <?php foreach (array_reverse($periodHistory) as $dateStr): ?>
+                    <?php $dateObj = new DateTime($dateStr); ?>
+                    <li>
+                        <?= htmlspecialchars($dateStr) ?> (<?= htmlspecialchars(getPolishWeekday($dateObj)) ?>)
+                    </li>
+                <?php endforeach; ?>
+            </ul>
+        <?php endif; ?>
+    </div>
+
+    <div class="box">
+        <h2>Wykres cyklu</h2>
+        <div class="timeline">
+            <?php foreach ($timelinePhases as $phase): ?>
+                <?php $width = ($phase['length'] / $effectiveCycleLength) * 100; ?>
+                <div class="timeline-phase" style="width: <?= $width ?>%">
+                    <?= htmlspecialchars($phase['label']) ?>
+                </div>
+            <?php endforeach; ?>
+            <div class="timeline-marker" style="left: <?= $todayPercent ?>%"></div>
+        </div>
+        <p>Aktualny dzień cyklu: <strong><?= $currentCycleDay ?></strong> (<?= htmlspecialchars($todayName) ?>)</p>
+    </div>
+
+    <div class="box">
+        <h2>Nadchodzące dni (z nazwą dnia)</h2>
+        <div class="week-grid">
+            <?php foreach ($upcomingWeek as $entry): ?>
+                <div class="week-card">
+                    <strong><?= htmlspecialchars($entry['weekday']) ?></strong><br>
+                    <?= htmlspecialchars($entry['date']) ?><br>
+                    Dzień cyklu: <?= $entry['cycle_day'] ?>
+                </div>
+            <?php endforeach; ?>
+        </div>
     </div>
 
     <div class="box">
