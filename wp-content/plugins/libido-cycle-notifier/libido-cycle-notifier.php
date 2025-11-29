@@ -47,6 +47,7 @@ class AC_Libido_Cycle_Notifier {
             'cycle_length'         => 28,
             'reminder_days_before' => 3,
             'notify_email'         => get_option('admin_email'),
+            'period_history'       => [],
         ];
     }
 
@@ -56,7 +57,51 @@ class AC_Libido_Cycle_Notifier {
         $merged   = wp_parse_args($opts, $defaults);
         $merged['cycle_length']         = max(20, min(40, (int) $merged['cycle_length']));
         $merged['reminder_days_before'] = max(0, min(10, (int) $merged['reminder_days_before']));
+        if (!is_array($merged['period_history'])) {
+            $merged['period_history'] = [];
+        }
         return $merged;
+    }
+
+    private function compute_average_cycle_length($dates) {
+        if (!is_array($dates) || count($dates) < 2) {
+            return null;
+        }
+
+        sort($dates);
+        $lengths = [];
+        for ($i = 1; $i < count($dates); $i++) {
+            $prev    = DateTime::createFromFormat('Y-m-d', $dates[$i - 1]);
+            $current = DateTime::createFromFormat('Y-m-d', $dates[$i]);
+            if (!$prev || !$current) {
+                continue;
+            }
+
+            $diff = (int) $prev->diff($current)->format('%r%a');
+            if ($diff > 0) {
+                $lengths[] = $diff;
+            }
+        }
+
+        if (empty($lengths)) {
+            return null;
+        }
+
+        return (int) round(array_sum($lengths) / count($lengths));
+    }
+
+    private function get_polish_weekday(DateTime $date) {
+        $names = [
+            1 => 'Poniedziałek',
+            2 => 'Wtorek',
+            3 => 'Środa',
+            4 => 'Czwartek',
+            5 => 'Piątek',
+            6 => 'Sobota',
+            7 => 'Niedziela',
+        ];
+
+        return $names[(int) $date->format('N')] ?? '';
     }
 
     private function get_phases() {
@@ -122,6 +167,9 @@ class AC_Libido_Cycle_Notifier {
         $options = $this->get_options();
         $phases  = $this->get_phases();
 
+        $historyMessage = '';
+        $historyError   = '';
+
         if (isset($_POST['aclibido_save'])) {
             check_admin_referer('aclibido_save_settings');
 
@@ -130,21 +178,62 @@ class AC_Libido_Cycle_Notifier {
             $options['reminder_days_before'] = (int) ($_POST['reminder_days_before'] ?? 3);
             $options['notify_email']         = sanitize_email($_POST['notify_email'] ?? '');
 
+            $historyDates = $options['period_history'];
+            $newDate      = $options['last_period_start'];
+            $dt           = DateTime::createFromFormat('Y-m-d', $newDate);
+            if ($dt && $dt->format('Y-m-d') === $newDate) {
+                if (!in_array($newDate, $historyDates, true)) {
+                    $historyDates[] = $newDate;
+                }
+            }
+            sort($historyDates);
+            $options['period_history'] = array_values(array_unique($historyDates));
+
             update_option($this->option_name, $options);
 
             echo '<div class="updated"><p>Ustawienia zapisane.</p></div>';
         }
 
+        if (isset($_POST['aclibido_add_history'])) {
+            check_admin_referer('aclibido_save_settings');
+            $historyDates = $options['period_history'];
+            $newDate      = sanitize_text_field($_POST['history_period_start'] ?? '');
+            $dt           = DateTime::createFromFormat('Y-m-d', $newDate);
+            if ($dt && $dt->format('Y-m-d') === $newDate) {
+                if (!in_array($newDate, $historyDates, true)) {
+                    $historyDates[]  = $newDate;
+                    sort($historyDates);
+                    $options['period_history'] = array_values(array_unique($historyDates));
+                    update_option($this->option_name, $options);
+                    $historyMessage = 'Dodano nową datę do historii: ' . esc_html($newDate);
+                } else {
+                    $historyMessage = 'Ta data jest już w historii: ' . esc_html($newDate);
+                }
+            } else {
+                $historyError = 'Podaj poprawną datę w formacie RRRR-MM-DD.';
+            }
+        }
+
         $today = new DateTime('now', wp_timezone());
         $todayStr = $today->format('Y-m-d');
+        $todayName = $this->get_polish_weekday($today);
 
-        $cycleStart = $this->get_current_cycle_start($options['last_period_start'], $options['cycle_length']);
-        $cycleDay   = $this->get_cycle_day($cycleStart, $options['cycle_length']);
-        $currentPhase = $this->get_phase_for_day($phases, $cycleDay, $options['cycle_length']);
+        $historyDates      = $options['period_history'];
+        $latestPeriodStart = !empty($historyDates) ? end($historyDates) : $options['last_period_start'];
+        $historyCycle      = $this->compute_average_cycle_length($historyDates);
+        $effectiveCycle    = $historyCycle ?: $options['cycle_length'];
+
+        $cycleStart   = $this->get_current_cycle_start($latestPeriodStart, $effectiveCycle);
+        $cycleDay     = $this->get_cycle_day($cycleStart, $effectiveCycle);
+        $currentPhase = $this->get_phase_for_day($phases, $cycleDay, $effectiveCycle);
 
         $libidoData = [];
-        for ($d = 1; $d <= $options['cycle_length']; $d++) {
-            $libidoData[] = $this->calculate_libido_score($d, $options['cycle_length']);
+        $labels = [];
+        for ($d = 1; $d <= $effectiveCycle; $d++) {
+            $libidoData[] = $this->calculate_libido_score($d, $effectiveCycle);
+            $labelDate    = clone $cycleStart;
+            $labelDate->modify('+' . ($d - 1) . ' days');
+            $labels[] = ['Dzień ' . $d, $this->get_polish_weekday($labelDate)];
         }
 
         ?>
@@ -233,12 +322,16 @@ class AC_Libido_Cycle_Notifier {
 
                     <div class="aclibido-box" style="margin-top:16px;">
                         <h3>Aktualny stan</h3>
-                        <p><span class="aclibido-label">Dzisiaj:</span> <?php echo esc_html($todayStr); ?></p>
-                        <?php if (!empty($options['last_period_start'])): ?>
+                        <p><span class="aclibido-label">Dzisiaj:</span> <?php echo esc_html($todayStr); ?> (<?php echo esc_html($todayName); ?>)</p>
+                        <?php if (!empty($latestPeriodStart)): ?>
                             <p><span class="aclibido-label">Początek aktualnie liczonego cyklu:</span>
                                 <?php echo esc_html($cycleStart->format('Y-m-d')); ?>
+                                (<?php echo esc_html($this->get_polish_weekday($cycleStart)); ?>)
                             </p>
                             <p><span class="aclibido-label">Dzień cyklu:</span> <?php echo esc_html($cycleDay); ?></p>
+                            <?php if ($historyCycle): ?>
+                                <p><span class="aclibido-label">Średnia długość cyklu (z historii):</span> <?php echo esc_html($historyCycle); ?> dni</p>
+                            <?php endif; ?>
                             <?php if ($currentPhase): ?>
                                 <p><span class="aclibido-label">Aktualna faza:</span> <?php echo esc_html($currentPhase['name']); ?></p>
                             <?php else: ?>
@@ -258,6 +351,39 @@ class AC_Libido_Cycle_Notifier {
                         Rzeczywiste libido partnerki może się różnić.
                     </p>
                 </div>
+            </div>
+
+            <div class="aclibido-box">
+                <h2>Historia pierwszych dni miesiączki</h2>
+                <form method="post" style="margin-bottom:12px;">
+                    <?php wp_nonce_field('aclibido_save_settings'); ?>
+                    <input type="hidden" name="aclibido_add_history" value="1" />
+                    <label for="history_period_start" class="aclibido-label">Dodaj nowy pierwszy dzień:</label>
+                    <input type="date" id="history_period_start" name="history_period_start" value="<?php echo esc_attr($todayStr); ?>" />
+                    <button class="button">Zapisz do historii</button>
+                </form>
+                <?php if (!empty($historyMessage)): ?>
+                    <div class="updated" style="padding:8px 10px;"> <?php echo $historyMessage; ?> </div>
+                <?php endif; ?>
+                <?php if (!empty($historyError)): ?>
+                    <div class="error" style="padding:8px 10px;"> <?php echo esc_html($historyError); ?> </div>
+                <?php endif; ?>
+                <p><span class="aclibido-label">Ostatni zapisany początek cyklu:</span> <?php echo esc_html($latestPeriodStart ?: '—'); ?></p>
+                <?php if ($historyCycle): ?>
+                    <p><span class="aclibido-label">Średnia długość cyklu z historii:</span> <?php echo esc_html($historyCycle); ?> dni</p>
+                <?php endif; ?>
+                <?php if (empty($historyDates)): ?>
+                    <p>Brak zapisanych dat – dodaj pierwszy wpis, aby zacząć liczyć średnią.</p>
+                <?php else: ?>
+                    <ul style="margin:0; padding-left:16px;"> 
+                        <?php foreach (array_reverse($historyDates) as $dateStr): ?>
+                            <?php $dateObj = DateTime::createFromFormat('Y-m-d', $dateStr); ?>
+                            <?php if ($dateObj): ?>
+                                <li><?php echo esc_html($dateStr); ?> (<?php echo esc_html($this->get_polish_weekday($dateObj)); ?>)</li>
+                            <?php endif; ?>
+                        <?php endforeach; ?>
+                    </ul>
+                <?php endif; ?>
             </div>
 
             <div class="aclibido-box aclibido-phases">
@@ -283,11 +409,30 @@ class AC_Libido_Cycle_Notifier {
                     const ctx = document.getElementById('aclibidoChart');
                     if (!ctx) return;
 
-                    const labels = [];
                     const data = <?php echo wp_json_encode($libidoData); ?>;
-                    for (let i = 1; i <= data.length; i++) {
-                        labels.push('Dzień ' + i);
-                    }
+                    const labels = <?php echo wp_json_encode($labels); ?>;
+                    const currentDay = <?php echo (int) $cycleDay; ?>;
+
+                    const markerPlugin = {
+                        id: 'aclibidoMarker',
+                        afterDraw(chart) {
+                            const {ctx, chartArea, scales} = chart;
+                            if (!scales?.x || !scales?.y) return;
+                            const xPos = scales.x.getPixelForValue(currentDay - 1);
+                            ctx.save();
+                            ctx.strokeStyle = '#e11d48';
+                            ctx.lineWidth = 2;
+                            ctx.beginPath();
+                            ctx.moveTo(xPos, chartArea.top);
+                            ctx.lineTo(xPos, chartArea.bottom);
+                            ctx.stroke();
+                            ctx.fillStyle = '#e11d48';
+                            ctx.font = '12px sans-serif';
+                            ctx.textAlign = 'center';
+                            ctx.fillText('Dziś', xPos, chartArea.top - 6);
+                            ctx.restore();
+                        }
+                    };
 
                     new Chart(ctx, {
                         type: 'line',
@@ -303,12 +448,25 @@ class AC_Libido_Cycle_Notifier {
                         options: {
                             responsive: true,
                             scales: {
+                                x: {
+                                    ticks: {
+                                        callback: function(value) {
+                                            return labels[value];
+                                        }
+                                    }
+                                },
                                 y: {
                                     suggestedMin: 0,
                                     suggestedMax: 100
                                 }
+                            },
+                            plugins: {
+                                legend: {
+                                    display: false
+                                }
                             }
-                        }
+                        },
+                        plugins: [markerPlugin]
                     });
                 })();
             </script>
@@ -319,13 +477,25 @@ class AC_Libido_Cycle_Notifier {
     public function shortcode_chart() {
         $options = $this->get_options();
 
-        if (empty($options['last_period_start'])) {
+        $historyDates      = $options['period_history'];
+        $latestPeriodStart = !empty($historyDates) ? end($historyDates) : $options['last_period_start'];
+        $historyCycle      = $this->compute_average_cycle_length($historyDates);
+        $effectiveCycle    = $historyCycle ?: $options['cycle_length'];
+
+        if (empty($latestPeriodStart)) {
             return '<p>Najpierw ustaw datę pierwszego dnia miesiączki w Ustawienia &rarr; Libido – cykl & libido.</p>';
         }
 
         $data = [];
-        for ($d = 1; $d <= $options['cycle_length']; $d++) {
-            $data[] = $this->calculate_libido_score($d, $options['cycle_length']);
+        $labels = [];
+        $cycleStart = $this->get_current_cycle_start($latestPeriodStart, $effectiveCycle);
+        $cycleDay   = $this->get_cycle_day($cycleStart, $effectiveCycle);
+
+        for ($d = 1; $d <= $effectiveCycle; $d++) {
+            $data[] = $this->calculate_libido_score($d, $effectiveCycle);
+            $labelDate    = clone $cycleStart;
+            $labelDate->modify('+' . ($d - 1) . ' days');
+            $labels[] = ['Dzień ' . $d, $this->get_polish_weekday($labelDate)];
         }
 
         ob_start();
@@ -339,10 +509,30 @@ class AC_Libido_Cycle_Notifier {
                 const ctx = document.getElementById('aclibidoChartFront');
                 if (!ctx) return;
                 const data = <?php echo wp_json_encode($data); ?>;
-                const labels = [];
-                for (let i = 1; i <= data.length; i++) {
-                    labels.push('Dzień ' + i);
-                }
+                const labels = <?php echo wp_json_encode($labels); ?>;
+                const currentDay = <?php echo (int) $cycleDay; ?>;
+
+                const markerPlugin = {
+                    id: 'aclibidoMarkerFront',
+                    afterDraw(chart) {
+                        const {ctx, chartArea, scales} = chart;
+                        if (!scales?.x || !scales?.y) return;
+                        const xPos = scales.x.getPixelForValue(currentDay - 1);
+                        ctx.save();
+                        ctx.strokeStyle = '#e11d48';
+                        ctx.lineWidth = 2;
+                        ctx.beginPath();
+                        ctx.moveTo(xPos, chartArea.top);
+                        ctx.lineTo(xPos, chartArea.bottom);
+                        ctx.stroke();
+                        ctx.fillStyle = '#e11d48';
+                        ctx.font = '12px sans-serif';
+                        ctx.textAlign = 'center';
+                        ctx.fillText('Dziś', xPos, chartArea.top - 6);
+                        ctx.restore();
+                    }
+                };
+
                 new Chart(ctx, {
                     type: 'line',
                     data: {
@@ -357,12 +547,25 @@ class AC_Libido_Cycle_Notifier {
                     options: {
                         responsive: true,
                         scales: {
+                            x: {
+                                ticks: {
+                                    callback: function(value) {
+                                        return labels[value];
+                                    }
+                                }
+                            },
                             y: {
                                 suggestedMin: 0,
                                 suggestedMax: 100
                             }
+                        },
+                        plugins: {
+                            legend: {
+                                display: false
+                            }
                         }
-                    }
+                    },
+                    plugins: [markerPlugin]
                 });
             })();
         </script>
@@ -383,10 +586,13 @@ class AC_Libido_Cycle_Notifier {
         $today  = new DateTime('now', $tz);
         $todayStr = $today->format('Y-m-d');
 
-        $cycleLength = (int) $options['cycle_length'];
+        $historyDates   = $options['period_history'];
+        $latestPeriod   = !empty($historyDates) ? end($historyDates) : $options['last_period_start'];
+        $historyCycle   = $this->compute_average_cycle_length($historyDates);
+        $cycleLength    = (int) ($historyCycle ?: $options['cycle_length']);
         $reminderDays = (int) $options['reminder_days_before'];
 
-        $currentCycleStart = $this->get_current_cycle_start($options['last_period_start'], $cycleLength);
+        $currentCycleStart = $this->get_current_cycle_start($latestPeriod, $cycleLength);
 
         for ($cycleOffset = 0; $cycleOffset <= 1; $cycleOffset++) {
             $cycleStart = clone $currentCycleStart;
