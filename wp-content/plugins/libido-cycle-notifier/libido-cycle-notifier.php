@@ -145,6 +145,25 @@ class AC_Libido_Cycle_Notifier {
         ];
     }
 
+    private function get_polish_month_name($monthNumber) {
+        $months = [
+            1  => 'stycznia',
+            2  => 'lutego',
+            3  => 'marca',
+            4  => 'kwietnia',
+            5  => 'maja',
+            6  => 'czerwca',
+            7  => 'lipca',
+            8  => 'sierpnia',
+            9  => 'września',
+            10 => 'października',
+            11 => 'listopada',
+            12 => 'grudnia',
+        ];
+
+        return $months[(int) $monthNumber] ?? '';
+    }
+
     public function register_settings_page() {
         add_options_page(
             'Libido – cykl & libido',
@@ -169,6 +188,8 @@ class AC_Libido_Cycle_Notifier {
 
         $historyMessage = '';
         $historyError   = '';
+        $testMessage    = '';
+        $testError      = '';
 
         if (isset($_POST['aclibido_save'])) {
             check_admin_referer('aclibido_save_settings');
@@ -227,13 +248,44 @@ class AC_Libido_Cycle_Notifier {
         $cycleDay     = $this->get_cycle_day($cycleStart, $effectiveCycle);
         $currentPhase = $this->get_phase_for_day($phases, $cycleDay, $effectiveCycle);
 
+        if (isset($_POST['aclibido_send_test'])) {
+            check_admin_referer('aclibido_save_settings');
+
+            $testEmail = sanitize_email($_POST['notify_email'] ?? $options['notify_email']);
+            if (empty($testEmail)) {
+                $testError = 'Podaj adres e-mail, aby wysłać testowe powiadomienie.';
+            } elseif (empty($latestPeriodStart)) {
+                $testError = 'Uzupełnij datę pierwszego dnia miesiączki, aby wyliczyć fazy.';
+            } else {
+                [$nextPhase, $nextPhaseStart] = $this->get_next_phase_info($phases, $cycleStart, $effectiveCycle);
+                $sent = $this->send_test_email($testEmail, $nextPhase, $nextPhaseStart, $options['reminder_days_before'], $cycleStart);
+                if ($sent) {
+                    $testMessage = 'Wysłano testowy email na adres ' . esc_html($testEmail) . ' (faza: ' . esc_html($nextPhase['name']) . ').';
+                } else {
+                    $testError = 'Nie udało się wysłać testowego maila. Sprawdź konfigurację SMTP.';
+                }
+            }
+        }
+
+        if (!empty($testMessage)) {
+            echo '<div class="updated"><p>' . $testMessage . '</p></div>';
+        }
+
+        if (!empty($testError)) {
+            echo '<div class="error"><p>' . esc_html($testError) . '</p></div>';
+        }
+
         $libidoData = [];
         $labels = [];
         for ($d = 1; $d <= $effectiveCycle; $d++) {
             $libidoData[] = $this->calculate_libido_score($d, $effectiveCycle);
             $labelDate    = clone $cycleStart;
             $labelDate->modify('+' . ($d - 1) . ' days');
-            $labels[] = ['Dzień ' . $d, $this->get_polish_weekday($labelDate)];
+            $labels[] = [
+                $labelDate->format('j') . ' ' . $this->get_polish_month_name($labelDate->format('n')),
+                'Dzień cyklu ' . $d,
+                $this->get_polish_weekday($labelDate)
+            ];
         }
 
         ?>
@@ -303,6 +355,10 @@ class AC_Libido_Cycle_Notifier {
                                 <td>
                                     <input type="email" id="notify_email" name="notify_email" size="40"
                                            value="<?php echo esc_attr($options['notify_email']); ?>" />
+                                    <p class="description" style="margin-top:6px;">
+                                        <button class="button" name="aclibido_send_test" value="1">Wyślij testowy email</button>
+                                        <span style="margin-left:8px;">Sprawdzisz, czy przyjdzie przypomnienie.</span>
+                                    </p>
                                 </td>
                             </tr>
                             <tr>
@@ -535,11 +591,15 @@ class AC_Libido_Cycle_Notifier {
             $data[] = $this->calculate_libido_score($d, $effectiveCycle);
             $labelDate    = clone $cycleStart;
             $labelDate->modify('+' . ($d - 1) . ' days');
-            $labels[] = ['Dzień ' . $d, $this->get_polish_weekday($labelDate)];
+            $labels[] = [
+                $labelDate->format('j') . ' ' . $this->get_polish_month_name($labelDate->format('n')),
+                'Dzień cyklu ' . $d,
+                $this->get_polish_weekday($labelDate)
+            ];
 
             $phaseForDay = $this->get_phase_for_day($this->get_phases(), $d, $effectiveCycle);
             $phaseName   = $phaseForDay['name'] ?? '—';
-            $phaseTooltip[] = 'Dzień ' . $d . ' (' . $phaseName . '): szacowane libido ' . $this->calculate_libido_score($d, $effectiveCycle) . '/100';
+            $phaseTooltip[] = $labelDate->format('j') . ' ' . $this->get_polish_month_name($labelDate->format('n')) . ' – dzień ' . $d . ' (' . $phaseName . '): szacowane libido ' . $this->calculate_libido_score($d, $effectiveCycle) . '/100';
         }
 
         $calendarDays = [];
@@ -553,6 +613,7 @@ class AC_Libido_Cycle_Notifier {
             $phaseForDate    = $this->get_phase_for_day($this->get_phases(), $cycleDayForDate, $effectiveCycle);
             $calendarDays[] = [
                 'day'       => (int) $dateObj->format('j'),
+                'month'     => $this->get_polish_month_name($dateObj->format('n')),
                 'weekday'   => $this->get_polish_weekday($dateObj),
                 'cycle_day' => $cycleDayForDate,
                 'phase'     => $phaseForDate['key'] ?? '',
@@ -595,16 +656,16 @@ class AC_Libido_Cycle_Notifier {
 
             <div class="aclibido-calendar">
                 <h4>Widok kalendarzowy</h4>
-                <div class="aclibido-calendar__grid">
-                    <?php foreach ($calendarDays as $day): ?>
-                        <div class="aclibido-calendar__cell" style="background: <?php echo esc_attr($day['color']); ?>22; border-color: <?php echo esc_attr($day['color']); ?>;">
-                            <div class="aclibido-calendar__date"><?php echo esc_html($day['day']); ?></div>
-                            <div class="aclibido-calendar__phase"><?php echo esc_html($day['label']); ?></div>
-                            <div class="aclibido-calendar__meta">Dzień cyklu: <?php echo esc_html($day['cycle_day']); ?></div>
+                        <div class="aclibido-calendar__grid">
+                            <?php foreach ($calendarDays as $day): ?>
+                                <div class="aclibido-calendar__cell" style="background: <?php echo esc_attr($day['color']); ?>22; border-color: <?php echo esc_attr($day['color']); ?>;">
+                                    <div class="aclibido-calendar__date"><?php echo esc_html($day['day'] . ' ' . $day['month']); ?></div>
+                                    <div class="aclibido-calendar__phase"><?php echo esc_html($day['label']); ?></div>
+                                    <div class="aclibido-calendar__meta">Dzień cyklu: <?php echo esc_html($day['cycle_day']); ?> • <?php echo esc_html($day['weekday']); ?></div>
+                                </div>
+                            <?php endforeach; ?>
                         </div>
-                    <?php endforeach; ?>
-                </div>
-            </div>
+                    </div>
         </div>
         <style>
             .aclibido-front { background:#fff; border:1px solid #e7e7e7; border-radius:16px; padding:18px; box-shadow:0 10px 30px rgba(0,0,0,0.05); font-family:'Inter', system-ui, -apple-system, sans-serif; }
@@ -817,33 +878,74 @@ class AC_Libido_Cycle_Notifier {
 
     private function send_email_for_phase($email, $phase, DateTime $phaseStart, $reminderDays, DateTime $cycleStart) {
         $subject = 'Faza cyklu za ' . $reminderDays . ' dni: ' . $phase['name'];
-
-        $lines = [
-            'Cześć Arek,',
-            '',
-            'Za około ' . $reminderDays . ' dni szacunkowo zacznie się faza:',
-            $phase['name'],
-            '',
-            'Start fazy (orientacyjnie): ' . $phaseStart->format('Y-m-d'),
-            'Początek tego cyklu (dzień 1 miesiączki): ' . $cycleStart->format('Y-m-d'),
-            '',
-            'Jak wygląda ta faza:',
-            '',
-            '- Bazowo: ' . $phase['desc_base'],
-            '- Przy Hashimoto: ' . $phase['desc_hashimoto'],
-            '- Przy wkładce hormonalnej: ' . $phase['desc_iud'],
-            '',
-            'Model libido w tej fazie jest przybliżony na podstawie badań o Hashimoto i levonorgestrelowych wkładkach.',
-            'To nie jest diagnoza medyczna, tylko orientacyjny „radar nastroju i libido”.',
-            '',
-            'Traktuj to jako podpowiedź, kiedy warto dać jej więcej przestrzeni, a kiedy większą szansę na bliskość 😊',
-        ];
-
-        $message = implode("\n", $lines);
-
+        $message = implode("\n", $this->build_phase_email_lines($phase, $phaseStart, $reminderDays, $cycleStart));
         $headers = ['Content-Type: text/plain; charset=UTF-8'];
 
         wp_mail($email, $subject, $message, $headers);
+    }
+
+    private function send_test_email($email, $phase, DateTime $phaseStart, $reminderDays, DateTime $cycleStart) {
+        $subject = 'Test: przypomnienie o fazie cyklu – ' . $phase['name'];
+        $message = implode("\n", $this->build_phase_email_lines($phase, $phaseStart, $reminderDays, $cycleStart, true));
+        $headers = ['Content-Type: text/plain; charset=UTF-8'];
+
+        return wp_mail($email, $subject, $message, $headers);
+    }
+
+    private function build_phase_email_lines($phase, DateTime $phaseStart, $reminderDays, DateTime $cycleStart, $isTest = false) {
+        $lines = [];
+        if ($isTest) {
+            $lines[] = 'To jest testowy email z przypomnieniem o fazie cyklu.';
+            $lines[] = 'Wysyłka testowa pomaga sprawdzić, czy dostajesz powiadomienia.';
+        } else {
+            $lines[] = 'Cześć Arek,';
+        }
+
+        $lines[] = '';
+        $lines[] = 'Za około ' . $reminderDays . ' dni szacunkowo zacznie się faza:';
+        $lines[] = $phase['name'];
+        $lines[] = '';
+        $lines[] = 'Start fazy (orientacyjnie): ' . $phaseStart->format('Y-m-d');
+        $lines[] = 'Początek tego cyklu (dzień 1 miesiączki): ' . $cycleStart->format('Y-m-d');
+
+        $lines[] = 'Najbliższy okres spodziewany: ' . $cycleStart->format('Y-m-d');
+        if ($phase['key'] === 'menstruacja') {
+            $lines[] = 'To przypomnienie o zbliżającej się miesiączce.';
+        }
+
+        $lines[] = '';
+        $lines[] = 'Jak wygląda ta faza:';
+        $lines[] = '';
+        $lines[] = '- Bazowo: ' . $phase['desc_base'];
+        $lines[] = '- Przy Hashimoto: ' . $phase['desc_hashimoto'];
+        $lines[] = '- Przy wkładce hormonalnej: ' . $phase['desc_iud'];
+        $lines[] = '';
+        $lines[] = 'Model libido w tej fazie jest przybliżony na podstawie badań o Hashimoto i levonorgestrelowych wkładkach.';
+        $lines[] = 'To nie jest diagnoza medyczna, tylko orientacyjny „radar nastroju i libido”.';
+        $lines[] = '';
+        $lines[] = 'Traktuj to jako podpowiedź, kiedy warto dać jej więcej przestrzeni, a kiedy większą szansę na bliskość 😊';
+
+        return $lines;
+    }
+
+    private function get_next_phase_info($phases, DateTime $cycleStart, $cycleLength) {
+        $currentDay = $this->get_cycle_day($cycleStart, $cycleLength);
+
+        foreach ($phases as $phase) {
+            if ($phase['start_day'] >= $currentDay) {
+                $phaseStart = clone $cycleStart;
+                $phaseStart->modify('+' . ($phase['start_day'] - 1) . ' days');
+                return [$phase, $phaseStart];
+            }
+        }
+
+        $nextCycleStart = clone $cycleStart;
+        $nextCycleStart->modify('+' . $cycleLength . ' days');
+        $firstPhase = $phases[0];
+        $phaseStart = clone $nextCycleStart;
+        $phaseStart->modify('+' . ($firstPhase['start_day'] - 1) . ' days');
+
+        return [$firstPhase, $phaseStart];
     }
 
     private function get_current_cycle_start($lastPeriodStart, $cycleLength) {
